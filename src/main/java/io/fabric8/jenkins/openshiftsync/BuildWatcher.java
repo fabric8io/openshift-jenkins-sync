@@ -15,176 +15,142 @@
  */
 package io.fabric8.jenkins.openshiftsync;
 
-import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
-import hudson.security.ACL;
-import hudson.triggers.SafeTimerTask;
-import io.fabric8.kubernetes.api.model.OwnerReference;
-import io.fabric8.kubernetes.client.Watcher.Action;
-import io.fabric8.openshift.api.model.Build;
-import io.fabric8.openshift.api.model.BuildConfig;
-import io.fabric8.openshift.api.model.BuildList;
-import io.fabric8.openshift.api.model.BuildStatus;
-import jenkins.model.Jenkins;
-import jenkins.security.NotReallyRoleSensitiveCallable;
+import static io.fabric8.jenkins.openshiftsync.BuildConfigToJobMap.getJobFromBuildConfig;
+import static io.fabric8.jenkins.openshiftsync.BuildPhases.NEW;
+import static io.fabric8.jenkins.openshiftsync.Constants.OPENSHIFT_ANNOTATIONS_BUILD_NUMBER;
+import static io.fabric8.jenkins.openshiftsync.Constants.OPENSHIFT_BUILD_STATUS_FIELD;
+import static io.fabric8.jenkins.openshiftsync.JenkinsUtils.handleBuildList;
+import static io.fabric8.jenkins.openshiftsync.OpenShiftUtils.getAuthenticatedOpenShiftClient;
+import static io.fabric8.jenkins.openshiftsync.OpenShiftUtils.getOpenshiftClient;
+import static io.fabric8.jenkins.openshiftsync.OpenShiftUtils.isPipelineStrategyBuild;
+import static java.util.logging.Level.SEVERE;
+import static java.util.logging.Level.WARNING;
 
-import org.apache.commons.lang.StringUtils;
-import org.jenkinsci.plugins.workflow.job.WorkflowJob;
-import org.jenkinsci.plugins.workflow.job.WorkflowRun;
-
-import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
-import java.util.ConcurrentModificationException;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
-import static io.fabric8.jenkins.openshiftsync.Annotations.BUILDCONFIG_NAME;
-import static io.fabric8.jenkins.openshiftsync.BuildConfigToJobMap.getJobFromBuildConfig;
-import static io.fabric8.jenkins.openshiftsync.BuildConfigToJobMap.getJobFromBuildConfigNameNamespace;
-import static io.fabric8.jenkins.openshiftsync.BuildPhases.CANCELLED;
-import static io.fabric8.jenkins.openshiftsync.Constants.OPENSHIFT_ANNOTATIONS_BUILD_NUMBER;
-import static io.fabric8.jenkins.openshiftsync.Constants.OPENSHIFT_BUILD_STATUS_FIELD;
-import static io.fabric8.jenkins.openshiftsync.JenkinsUtils.cancelBuild;
-import static io.fabric8.jenkins.openshiftsync.JenkinsUtils.deleteRun;
-import static io.fabric8.jenkins.openshiftsync.JenkinsUtils.getJobFromBuild;
-import static io.fabric8.jenkins.openshiftsync.JenkinsUtils.handleBuildList;
-import static io.fabric8.jenkins.openshiftsync.JenkinsUtils.triggerJob;
-import static io.fabric8.jenkins.openshiftsync.OpenShiftUtils.getAuthenticatedOpenShiftClient;
-import static io.fabric8.jenkins.openshiftsync.OpenShiftUtils.isCancellable;
-import static io.fabric8.jenkins.openshiftsync.OpenShiftUtils.isCancelled;
-import static io.fabric8.jenkins.openshiftsync.OpenShiftUtils.isNew;
-import static io.fabric8.jenkins.openshiftsync.OpenShiftUtils.updateOpenShiftBuildPhase;
-import static io.fabric8.jenkins.openshiftsync.OpenShiftUtils.getAnnotation;
-import static java.util.logging.Level.WARNING;
+import org.apache.commons.lang.StringUtils;
+import org.jenkinsci.plugins.workflow.job.WorkflowJob;
 
-public class BuildWatcher extends BaseWatcher {
-    private static final Logger logger = Logger.getLogger(BuildWatcher.class
-            .getName());
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
+import io.fabric8.kubernetes.api.model.Status;
+import io.fabric8.kubernetes.client.KubernetesClientException;
+import io.fabric8.kubernetes.client.WatcherException;
+import io.fabric8.openshift.api.model.Build;
+import io.fabric8.openshift.api.model.BuildConfig;
+import io.fabric8.openshift.api.model.BuildList;
+import io.fabric8.openshift.client.OpenShiftClient;
 
-    // now that listing interval is 5 minutes (used to be 10 seconds), we have
-    // seen
-    // timing windows where if the build watch events come before build config
-    // watch events
-    // when both are created in a simultaneous fashion, there is an up to 5
-    // minute delay
-    // before the job run gets kicked off
-    // started seeing duplicate builds getting kicked off so quit depending on
-    // so moved off of concurrent hash set to concurrent hash map using 
-    // namepace/name key
-    private static final ConcurrentHashMap<String,Build> buildsWithNoBCList = new ConcurrentHashMap<String,Build>();
+public class BuildWatcher extends BaseWatcher<Build> {
+    private static final Logger logger = Logger.getLogger(BuildWatcher.class.getName());
 
     @SuppressFBWarnings("EI_EXPOSE_REP2")
-    public BuildWatcher(String[] namespaces) {
-        super(namespaces);
+    public BuildWatcher(String namespace) {
+        super(namespace);
     }
 
     @Override
-    public int getListIntervalInSeconds() {
+    public int getResyncPeriodMilliseconds() {
         return GlobalPluginConfiguration.get().getBuildListInterval();
-    }
-
-    @Override
-    public Runnable getStartTimerTask() {
-        return new SafeTimerTask() {
-            @Override
-            public void doRun() {
-                if (!CredentialsUtils.hasCredentials()) {
-                    logger.fine("No Openshift Token credential defined.");
-                    return;
-                }
-                // prior to finding new builds poke the BuildWatcher builds with
-                // no BC list and see if we
-                // can create job runs for premature builds we already know
-                // about
-                BuildWatcher.flushBuildsWithNoBCList();
-                for (String namespace : namespaces) {
-                    BuildList newBuilds = null;
-                    try {
-                        logger.fine("listing Build resources");
-                        newBuilds = getAuthenticatedOpenShiftClient()
-                                .builds()
-                                .inNamespace(namespace)
-                                .withField(OPENSHIFT_BUILD_STATUS_FIELD,
-                                        BuildPhases.NEW).list();
-                        onInitialBuilds(newBuilds);
-                        logger.fine("handled Build resources");
-                    } catch (Exception e) {
-                        logger.log(Level.SEVERE,
-                                "Failed to load initial Builds: " + e, e);
-                    }
-                    try {
-                        String resourceVersion = "0";
-                        if (newBuilds == null) {
-                            logger.warning("Unable to get build list; impacts resource version used for watch");
-                        } else {
-                            resourceVersion = newBuilds.getMetadata()
-                                    .getResourceVersion();
-                        }
-                        if (watches.get(namespace) == null) {
-                            logger.info("creating Build watch for namespace "
-                                    + namespace
-                                    + " and resource version "
-                                    + resourceVersion);
-
-                            addWatch(namespace, getAuthenticatedOpenShiftClient()
-                              .builds()
-                              .inNamespace(namespace)
-                              .withResourceVersion(
-                                resourceVersion)
-                              .watch(new WatcherCallback<Build>(
-                                BuildWatcher.this,
-                                namespace)));
-                        }
-                    } catch (Exception e) {
-                        logger.log(Level.SEVERE,
-                                "Failed to load initial Builds: " + e, e);
-                    }
-                }
-                reconcileRunsAndBuilds();
-            }
-        };
     }
 
     public void start() {
         BuildToActionMapper.initialize();
-        super.start();
+        logger.info("Now handling startup build for " + namespace + " !!");
+
+        // prior to finding new builds poke the BuildWatcher builds with
+        // no BC list and see if we
+        // can create job runs for premature builds we already know
+        // about
+        BuildManager.flushBuildsWithNoBCList();
+        String ns = this.namespace;
+        BuildList newBuilds = null;
+        try {
+            logger.fine("listing Build resources");
+            OpenShiftClient client = getAuthenticatedOpenShiftClient();
+            newBuilds = client.builds().inNamespace(ns).withField(OPENSHIFT_BUILD_STATUS_FIELD, NEW).list();
+            onInitialBuilds(newBuilds);
+            logger.fine("handled Build resources");
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "Failed to load initial Builds: " + e, e);
+        }
+        try {
+            String rv = "0";
+            if (newBuilds == null) {
+                logger.warning("Unable to get build list; impacts resource version used for watch");
+            } else {
+                rv = newBuilds.getMetadata().getResourceVersion();
+            }
+
+            if (this.watch == null) {
+                synchronized (this.lock) {
+                    if (this.watch == null) {
+                        logger.info("creating Build watch for namespace " + ns + " and resource version " + rv);
+                        OpenShiftClient client = getOpenshiftClient();
+                        this.watch = client.builds().inNamespace(ns).withResourceVersion(rv).watch(this);
+                    }
+                }
+            }
+        } catch (KubernetesClientException e) {
+            logger.log(SEVERE, "Failed to load initial Builds: " + e, e);
+            this.watch.close();
+            Status status = e.getStatus();
+            String message = status != null ? status.getMessage() : "Unknown status on query";
+            // TODO add a throttling mechancism to wait before retying in loop
+            try {
+                Thread.sleep(5000);
+            } catch (InterruptedException e1) {
+            }
+            this.onClose(new WatcherException(message, e));
+        } catch (Exception e) {
+            logger.log(SEVERE, "Failed to load initial Builds: " + e, e);
+        }
+        BuildManager.reconcileRunsAndBuilds();
+    }
+
+    public void startAfterOnClose(String namespace) {
+        synchronized (this.lock) {
+            start();
+        }
     }
 
     @SuppressFBWarnings("SF_SWITCH_NO_DEFAULT")
-    public void eventReceived(Action action, Build build) {
-        if (!OpenShiftUtils.isPipelineStrategyBuild(build))
-            return;
-        try {
-            switch (action) {
-            case ADDED:
-                addEventToJenkinsJobRun(build);
-                break;
-            case MODIFIED:
-                modifyEventToJenkinsJobRun(build);
-                break;
-            case DELETED:
-                deleteEventToJenkinsJobRun(build);
-                break;
-            case ERROR:
-                logger.warning("watch for build " + build.getMetadata().getName() + " received error event ");
-                break;
-            default:
-                logger.warning("watch for build " + build.getMetadata().getName() + " received unknown event " + action);
-                break;
-            }
-        } catch (Exception e) {
-            logger.log(WARNING, "Caught: " + e, e);
-        }
-    }
     @Override
-    public <T> void eventReceived(io.fabric8.kubernetes.client.Watcher.Action action, T resource) {
-        Build build = (Build)resource;
-        eventReceived(action, build);
+    public void eventReceived(Action action, Build build) {
+        if (build == null) {
+            logger.warning("Received  event with null Build: " + action + ", ignoring: " + this);
+            return;
+        }
+        if (isPipelineStrategyBuild(build)) {
+            try {
+                String name = build.getMetadata().getName();
+                switch (action) {
+                case ADDED:
+                    BuildManager.addEventToJenkinsJobRun(build);
+                    break;
+                case MODIFIED:
+                    BuildManager.modifyEventToJenkinsJobRun(build);
+                    break;
+                case DELETED:
+                    BuildManager.deleteEventToJenkinsJobRun(build);
+                    break;
+                case ERROR:
+                    logger.warning("watch for build " + name + " received error event ");
+                    break;
+                default:
+                    logger.warning("watch for build " + name + " received unknown event " + action);
+                    break;
+                }
+            } catch (Exception e) {
+                logger.log(WARNING, "Caught: " + e, e);
+            }
+        }
     }
 
     public static void onInitialBuilds(BuildList buildList) {
@@ -197,24 +163,16 @@ public class BuildWatcher extends BaseWatcher {
                 @Override
                 public int compare(Build b1, Build b2) {
                     if (b1.getMetadata().getAnnotations() == null
-                            || b1.getMetadata().getAnnotations()
-                                    .get(OPENSHIFT_ANNOTATIONS_BUILD_NUMBER) == null) {
-                        logger.warning("cannot compare build "
-                                + b1.getMetadata().getName()
-                                + " from namespace "
-                                + b1.getMetadata().getNamespace()
-                                + ", has bad annotations: "
+                            || b1.getMetadata().getAnnotations().get(OPENSHIFT_ANNOTATIONS_BUILD_NUMBER) == null) {
+                        logger.warning("cannot compare build " + b1.getMetadata().getName() + " from namespace "
+                                + b1.getMetadata().getNamespace() + ", has bad annotations: "
                                 + b1.getMetadata().getAnnotations());
                         return 0;
                     }
                     if (b2.getMetadata().getAnnotations() == null
-                            || b2.getMetadata().getAnnotations()
-                                    .get(OPENSHIFT_ANNOTATIONS_BUILD_NUMBER) == null) {
-                        logger.warning("cannot compare build "
-                                + b2.getMetadata().getName()
-                                + " from namespace "
-                                + b2.getMetadata().getNamespace()
-                                + ", has bad annotations: "
+                            || b2.getMetadata().getAnnotations().get(OPENSHIFT_ANNOTATIONS_BUILD_NUMBER) == null) {
+                        logger.warning("cannot compare build " + b2.getMetadata().getName() + " from namespace "
+                                + b2.getMetadata().getNamespace() + ", has bad annotations: "
                                 + b2.getMetadata().getAnnotations());
                         return 0;
                     }
@@ -222,14 +180,10 @@ public class BuildWatcher extends BaseWatcher {
                     try {
                         rc = Long.compare(
 
-                                Long.parseLong(b1
-                                        .getMetadata()
-                                        .getAnnotations()
-                                        .get(OPENSHIFT_ANNOTATIONS_BUILD_NUMBER)),
-                                Long.parseLong(b2
-                                        .getMetadata()
-                                        .getAnnotations()
-                                        .get(OPENSHIFT_ANNOTATIONS_BUILD_NUMBER)));
+                                Long.parseLong(
+                                        b1.getMetadata().getAnnotations().get(OPENSHIFT_ANNOTATIONS_BUILD_NUMBER)),
+                                Long.parseLong(
+                                        b2.getMetadata().getAnnotations().get(OPENSHIFT_ANNOTATIONS_BUILD_NUMBER)));
                     } catch (Throwable t) {
                         logger.log(Level.FINE, "onInitialBuilds", t);
                     }
@@ -240,8 +194,7 @@ public class BuildWatcher extends BaseWatcher {
             // We need to sort the builds into their build configs so we can
             // handle build run policies correctly.
             Map<String, BuildConfig> buildConfigMap = new HashMap<>();
-            Map<BuildConfig, List<Build>> buildConfigBuildMap = new HashMap<>(
-                    items.size());
+            Map<BuildConfig, List<Build>> buildConfigBuildMap = new HashMap<>(items.size());
             for (Build b : items) {
                 if (!OpenShiftUtils.isPipelineStrategyBuild(b))
                     continue;
@@ -253,9 +206,8 @@ public class BuildWatcher extends BaseWatcher {
                 String bcMapKey = namespace + "/" + buildConfigName;
                 BuildConfig bc = buildConfigMap.get(bcMapKey);
                 if (bc == null) {
-                    bc = getAuthenticatedOpenShiftClient().buildConfigs()
-                            .inNamespace(namespace).withName(buildConfigName)
-                            .get();
+                    bc = getAuthenticatedOpenShiftClient().buildConfigs().inNamespace(namespace)
+                            .withName(buildConfigName).get();
                     if (bc == null) {
                         // if the bc is not there via a REST get, then it is not
                         // going to be, and we are not handling manual creation
@@ -273,8 +225,7 @@ public class BuildWatcher extends BaseWatcher {
             }
 
             // Now handle the builds.
-            for (Map.Entry<BuildConfig, List<Build>> buildConfigBuilds : buildConfigBuildMap
-                    .entrySet()) {
+            for (Map.Entry<BuildConfig, List<Build>> buildConfigBuilds : buildConfigBuildMap.entrySet()) {
                 BuildConfig bc = buildConfigBuilds.getKey();
                 if (bc.getMetadata() == null) {
                     // Should never happen but let's be safe...
@@ -284,22 +235,17 @@ public class BuildWatcher extends BaseWatcher {
                 if (job == null) {
                     List<Build> builds = buildConfigBuilds.getValue();
                     for (Build b : builds) {
-                        logger.info("skipping listed new build "
-                                + b.getMetadata().getName()
-                                + " no job at this time");
-                        addBuildToNoBCList(b);
+                        logger.info("skipping listed new build " + b.getMetadata().getName() + " no job at this time");
+                        BuildManager.addBuildToNoBCList(b);
                     }
                     continue;
                 }
-                BuildConfigProjectProperty bcp = job
-                        .getProperty(BuildConfigProjectProperty.class);
+                BuildConfigProjectProperty bcp = job.getProperty(BuildConfigProjectProperty.class);
                 if (bcp == null) {
                     List<Build> builds = buildConfigBuilds.getValue();
                     for (Build b : builds) {
-                        logger.info("skipping listed new build "
-                                + b.getMetadata().getName()
-                                + " no prop at this time");
-                        addBuildToNoBCList(b);
+                        logger.info("skipping listed new build " + b.getMetadata().getName() + " no prop at this time");
+                        BuildManager.addBuildToNoBCList(b);
                     }
                     continue;
                 }
@@ -308,203 +254,5 @@ public class BuildWatcher extends BaseWatcher {
             }
         }
     }
-
-    private static void modifyEventToJenkinsJobRun(Build build) {
-        BuildStatus status = build.getStatus();
-        if (status != null && isCancellable(status) && isCancelled(status)) {
-            WorkflowJob job = getJobFromBuild(build);
-            if (job != null) {
-                cancelBuild(job, build);
-            } else {
-                removeBuildFromNoBCList(build);
-            }
-        } else {
-            // see if any pre-BC cached builds can now be flushed
-            flushBuildsWithNoBCList();
-        }
-    }
-
-    public static boolean addEventToJenkinsJobRun(Build build)
-            throws IOException {
-        // should have been caught upstack, but just in case since public method
-        if (!OpenShiftUtils.isPipelineStrategyBuild(build))
-            return false;
-        BuildStatus status = build.getStatus();
-        if (status != null) {
-            if (isCancelled(status)) {
-                updateOpenShiftBuildPhase(build, CANCELLED);
-                return false;
-            }
-            if (!isNew(status)) {
-                return false;
-            }
-        }
-
-        WorkflowJob job = getJobFromBuild(build);
-        if (job != null) {
-            return triggerJob(job, build);
-        }
-        logger.info("skipping watch event for build "
-                + build.getMetadata().getName() + " no job at this time");
-        addBuildToNoBCList(build);
-        return false;
-    }
-
-    private static void addBuildToNoBCList(Build build) {
-        // should have been caught upstack, but just in case since public method
-        if (!OpenShiftUtils.isPipelineStrategyBuild(build))
-            return;
-        try {
-          buildsWithNoBCList.put(build.getMetadata().getNamespace()+build.getMetadata().getName(), build);
-        } catch (ConcurrentModificationException | IllegalArgumentException |
-          UnsupportedOperationException | NullPointerException e) {
-          logger.log(Level.WARNING,"Failed to add item " +
-            build.getMetadata().getName(), e);
-        }
-    }
-
-    private static void removeBuildFromNoBCList(Build build) {
-          buildsWithNoBCList.remove(build.getMetadata().getNamespace()+build.getMetadata().getName());
-    }
-
-    // trigger any builds whose watch events arrived before the
-    // corresponding build config watch events
-    public static void flushBuildsWithNoBCList() {
-        
-        ConcurrentHashMap<String,Build> clone = null;
-        synchronized(buildsWithNoBCList) {
-            clone = new ConcurrentHashMap<String,Build>(buildsWithNoBCList);
-        }
-        boolean anyRemoveFailures = false;
-        for (Build build : clone.values()) {
-            WorkflowJob job = getJobFromBuild(build);
-            if (job != null) {
-                try {
-                    logger.info("triggering job run for previously skipped build " + build.getMetadata().getName());
-                    triggerJob(job, build);
-                } catch (IOException e) {
-                    logger.log(Level.WARNING, "flushBuildsWithNoBCList", e);
-                }
-                try {
-                    synchronized(buildsWithNoBCList) {
-                        removeBuildFromNoBCList(build);
-                    }
-                } catch (Throwable t) {
-                    // TODO
-                    // concurrent mod exceptions are not suppose to occur
-                    // with concurrent hash set; this try/catch with log
-                    // and the anyRemoveFailures post processing is a bit
-                    // of safety paranoia until this proves to be true
-                    // over extended usage ... probably can remove at some
-                    // point
-                    anyRemoveFailures = true;
-                    logger.log(Level.WARNING, "flushBuildsWithNoBCList", t);
-                }
-            }
-            
-            synchronized(buildsWithNoBCList) {
-                if (anyRemoveFailures && buildsWithNoBCList.size() > 0) {
-                    buildsWithNoBCList.clear();
-                }            
-                
-            }
-        }
-    }
-
-    // innerDeleteEventToJenkinsJobRun is the actual delete logic at the heart
-    // of deleteEventToJenkinsJobRun
-    // that is either in a sync block or not based on the presence of a BC uid
-    private static void innerDeleteEventToJenkinsJobRun(
-            final Build build) throws Exception {
-        final WorkflowJob job = getJobFromBuild(build);
-        if (job != null) {
-          ACL.impersonate(ACL.SYSTEM,
-            new NotReallyRoleSensitiveCallable<Void, Exception>() {
-              @Override
-              public Void call() throws Exception {
-                cancelBuild(job, build, true);
-                return null;
-              }
-            });
-        } else {
-            // in case build was created and deleted quickly, prior to seeing BC
-            // event, clear out from pre-BC cache
-            removeBuildFromNoBCList(build);
-        }
-        deleteRun(job, build);
-    }
-
-    // in response to receiving an openshift delete build event, this method
-    // will drive
-    // the clean up of the Jenkins job run the build is mapped one to one with;
-    // as part of that
-    // clean up it will synchronize with the build config event watcher to
-    // handle build config
-    // delete events and build delete events that arrive concurrently and in a
-    // nondeterministic
-    // order
-    private static void deleteEventToJenkinsJobRun(
-            final Build build) throws Exception {
-        List<OwnerReference> ownerRefs = build.getMetadata()
-                .getOwnerReferences();
-        String bcUid = null;
-        for (OwnerReference ref : ownerRefs) {
-            if ("BuildConfig".equals(ref.getKind()) && ref.getUid() != null
-                    && ref.getUid().length() > 0) {
-                // employ intern to facilitate sync'ing on the same actual
-                // object
-                bcUid = ref.getUid().intern();
-                synchronized (bcUid) {
-                    // if entire job already deleted via bc delete, just return
-                    if (getJobFromBuildConfigNameNamespace(getAnnotation(build, BUILDCONFIG_NAME),
-                            build.getMetadata().getNamespace()) == null) {
-                      return;
-                    }
-                    innerDeleteEventToJenkinsJobRun(build);
-                    return;
-                }
-            }
-        }
-        // otherwise, if something odd is up and there is no parent BC, just
-        // clean up
-        innerDeleteEventToJenkinsJobRun(build);
-    }
-
-  /**
-   * Reconciles Jenkins job runs and OpenShift builds
-   *
-   * Deletes all job runs that do not have an associated build in OpenShift
-   */
-  private static void reconcileRunsAndBuilds() {
-    logger.info("Reconciling job runs and builds");
-
-    List<WorkflowJob> jobs = Jenkins.getActiveInstance().getAllItems(WorkflowJob.class);
-
-    for (WorkflowJob job : jobs) {
-      BuildConfigProjectProperty property = job.getProperty(BuildConfigProjectProperty.class);
-      if (property == null || StringUtils.isBlank(property.getNamespace()) || StringUtils.isBlank(property.getName())) {
-        continue;
-      }
-
-      logger.info("Checking job " + job.toString() + " runs for BuildConfig " + property.getNamespace() + "/" + property.getName());
-
-      BuildList buildList = getAuthenticatedOpenShiftClient().builds()
-        .inNamespace(property.getNamespace()).withLabel("buildconfig=" + property.getName()).list();
-
-      for (WorkflowRun run : job.getBuilds()) {
-        boolean found = false;
-        BuildCause cause = run.getCause(BuildCause.class);
-        for (Build build : buildList.getItems()) {
-          if (cause != null && cause.getUid().equals(build.getMetadata().getUid())) {
-            found = true;
-            break;
-          }
-        }
-        if (!found) {
-          deleteRun(run);
-        }
-      }
-    }
-  }
 
 }

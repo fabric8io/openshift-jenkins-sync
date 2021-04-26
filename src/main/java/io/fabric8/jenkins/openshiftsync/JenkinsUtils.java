@@ -21,7 +21,6 @@ import static io.fabric8.jenkins.openshiftsync.BuildPhases.CANCELLED;
 import static io.fabric8.jenkins.openshiftsync.BuildPhases.PENDING;
 import static io.fabric8.jenkins.openshiftsync.BuildRunPolicy.SERIAL;
 import static io.fabric8.jenkins.openshiftsync.BuildRunPolicy.SERIAL_LATEST_ONLY;
-import static io.fabric8.jenkins.openshiftsync.BuildWatcher.addEventToJenkinsJobRun;
 import static io.fabric8.jenkins.openshiftsync.Constants.OPENSHIFT_ANNOTATIONS_BUILD_NUMBER;
 import static io.fabric8.jenkins.openshiftsync.Constants.OPENSHIFT_BUILD_STATUS_FIELD;
 import static io.fabric8.jenkins.openshiftsync.Constants.OPENSHIFT_LABELS_BUILD_CONFIG_NAME;
@@ -783,7 +782,7 @@ public class JenkinsUtils {
 			}
 			boolean buildAdded = false;
 			try {
-				buildAdded = addEventToJenkinsJobRun(b);
+				buildAdded =  BuildManager.addEventToJenkinsJobRun(b);
 			} catch (IOException e) {
 				ObjectMeta meta = b.getMetadata();
 				LOGGER.log(WARNING, "Failed to add new build " + meta.getNamespace() + "/" + meta.getName(), e);

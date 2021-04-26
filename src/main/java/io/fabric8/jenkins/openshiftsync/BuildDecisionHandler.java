@@ -77,7 +77,7 @@ public class BuildDecisionHandler extends Queue.QueueDecisionHandler {
 
                 ParametersAction params = dumpParams(actions);
                 if (LOGGER.isLoggable(Level.FINE)) {
-                    LOGGER.fine("ParametersAction: " + params.toString());
+                    LOGGER.fine("ParametersAction: " + params);
                 }
                 if (params != null && ret != null)
                     BuildToActionMapper.addParameterAction(ret.getMetadata()

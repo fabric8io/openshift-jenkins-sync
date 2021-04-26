@@ -15,43 +15,12 @@
  */
 package io.fabric8.jenkins.openshiftsync;
 
-import com.cloudbees.hudson.plugins.folder.Folder;
-import com.fasterxml.jackson.annotation.JsonIgnore;
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
-
-import hudson.model.ItemGroup;
-import hudson.BulkChange;
-import hudson.model.Item;
-import hudson.util.XStream2;
-import io.fabric8.kubernetes.api.model.HasMetadata;
-import io.fabric8.kubernetes.api.model.ObjectMeta;
-import io.fabric8.kubernetes.api.model.ReplicationController;
-import io.fabric8.kubernetes.api.model.ReplicationControllerStatus;
-import io.fabric8.kubernetes.api.model.Service;
-import io.fabric8.kubernetes.api.model.ServiceSpec;
-import io.fabric8.kubernetes.client.Config;
-import io.fabric8.kubernetes.client.Version;
-import io.fabric8.openshift.api.model.Build;
-import io.fabric8.openshift.api.model.BuildConfig;
-import io.fabric8.openshift.api.model.BuildConfigSpec;
-import io.fabric8.openshift.api.model.BuildSource;
-import io.fabric8.openshift.api.model.BuildStatus;
-import io.fabric8.openshift.api.model.GitBuildSource;
-import io.fabric8.openshift.api.model.Route;
-import io.fabric8.openshift.api.model.RouteList;
-import io.fabric8.openshift.api.model.RouteSpec;
-import io.fabric8.openshift.client.DefaultOpenShiftClient;
-import io.fabric8.openshift.client.OpenShiftClient;
-import io.fabric8.openshift.client.OpenShiftConfigBuilder;
-import jenkins.model.Jenkins;
-
-import org.apache.commons.lang.StringUtils;
-import org.apache.tools.ant.filters.StringInputStream;
-import org.joda.time.DateTime;
-import org.joda.time.format.DateTimeFormatter;
-import org.joda.time.format.ISODateTimeFormat;
+import static io.fabric8.jenkins.openshiftsync.BuildPhases.NEW;
+import static io.fabric8.jenkins.openshiftsync.BuildPhases.PENDING;
+import static io.fabric8.jenkins.openshiftsync.BuildPhases.RUNNING;
+import static io.fabric8.jenkins.openshiftsync.Constants.OPENSHIFT_DEFAULT_NAMESPACE;
+import static java.util.logging.Level.FINE;
+import static java.util.logging.Level.INFO;
 
 import java.io.BufferedReader;
 import java.io.File;
@@ -68,25 +37,60 @@ import java.util.Map;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
-import static io.fabric8.jenkins.openshiftsync.BuildPhases.NEW;
-import static io.fabric8.jenkins.openshiftsync.BuildPhases.PENDING;
-import static io.fabric8.jenkins.openshiftsync.BuildPhases.RUNNING;
-import static io.fabric8.jenkins.openshiftsync.Constants.OPENSHIFT_DEFAULT_NAMESPACE;
-import static java.util.logging.Level.FINE;
+import org.apache.commons.lang.StringUtils;
+import org.apache.commons.lang.builder.ReflectionToStringBuilder;
+import org.apache.tools.ant.filters.StringInputStream;
+import org.joda.time.DateTime;
+import org.joda.time.format.DateTimeFormatter;
+import org.joda.time.format.ISODateTimeFormat;
+
+import com.cloudbees.hudson.plugins.folder.Folder;
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
+
+import hudson.BulkChange;
+import hudson.model.Item;
+import hudson.model.ItemGroup;
+import hudson.util.XStream2;
+import io.fabric8.kubernetes.api.model.HasMetadata;
+import io.fabric8.kubernetes.api.model.ObjectMeta;
+import io.fabric8.kubernetes.api.model.ReplicationController;
+import io.fabric8.kubernetes.api.model.ReplicationControllerStatus;
+import io.fabric8.kubernetes.api.model.Service;
+import io.fabric8.kubernetes.api.model.ServiceSpec;
+import io.fabric8.kubernetes.client.Config;
+import io.fabric8.kubernetes.client.Version;
+import io.fabric8.kubernetes.client.informers.SharedInformerFactory;
+import io.fabric8.openshift.api.model.Build;
+import io.fabric8.openshift.api.model.BuildBuilder;
+import io.fabric8.openshift.api.model.BuildConfig;
+import io.fabric8.openshift.api.model.BuildConfigSpec;
+import io.fabric8.openshift.api.model.BuildSource;
+import io.fabric8.openshift.api.model.BuildStatus;
+import io.fabric8.openshift.api.model.GitBuildSource;
+import io.fabric8.openshift.api.model.Route;
+import io.fabric8.openshift.api.model.RouteList;
+import io.fabric8.openshift.api.model.RouteSpec;
+import io.fabric8.openshift.client.DefaultOpenShiftClient;
+import io.fabric8.openshift.client.OpenShiftClient;
+import io.fabric8.openshift.client.OpenShiftConfigBuilder;
+import jenkins.model.Jenkins;
+import okhttp3.Dispatcher;
 
 /**
  */
 public class OpenShiftUtils {
 
-    private final static Logger logger = Logger.getLogger(OpenShiftUtils.class
-            .getName());
+    private final static Logger logger = Logger.getLogger(OpenShiftUtils.class.getName());
 
     private static OpenShiftClient openShiftClient;
     private static String jenkinsPodNamespace = null;
-    
+    private static final Jenkins JENKINS_INSTANCE = Jenkins.getInstanceOrNull();
+
     static {
-        jenkinsPodNamespace = System
-                .getProperty(Constants.OPENSHIFT_PROJECT_ENV_VAR_NAME);
+        jenkinsPodNamespace = System.getProperty(Constants.OPENSHIFT_PROJECT_ENV_VAR_NAME);
         if (jenkinsPodNamespace != null && jenkinsPodNamespace.trim().length() > 0) {
             jenkinsPodNamespace = jenkinsPodNamespace.trim();
         } else {
@@ -119,30 +123,37 @@ public class OpenShiftUtils {
         }
     }
 
-    private static final DateTimeFormatter dateFormatter = ISODateTimeFormat
-            .dateTimeNoMillis();
+    private static final DateTimeFormatter dateFormatter = ISODateTimeFormat.dateTimeNoMillis();
 
     /**
      * Initializes an {@link OpenShiftClient}
      *
-     * @param serverUrl
-     *            the optional URL of where the OpenShift cluster API server is
-     *            running
+     * @param serverUrl the optional URL of where the OpenShift cluster API server
+     *                  is running
+     * @param maxConnections2 
      */
-    public synchronized static void initializeOpenShiftClient(String serverUrl) {
+    public synchronized static void initializeOpenShiftClient(String serverUrl, int maxConnections) {
+        if (openShiftClient != null) {
+            logger.log(INFO, "Closing already initialized openshift client");
+            openShiftClient.close();
+        }
         OpenShiftConfigBuilder configBuilder = new OpenShiftConfigBuilder();
         if (serverUrl != null && !serverUrl.isEmpty()) {
             configBuilder.withMasterUrl(serverUrl);
         }
         Config config = configBuilder.build();
-        config.setUserAgent("openshift-sync-plugin-"
-                + Jenkins.getInstance().getPluginManager()
-                        .getPlugin("openshift-sync").getVersion() + "/fabric8-"
-                + Version.clientVersion());
+        logger.log(INFO, "Current OpenShift Client Configuration: " + ReflectionToStringBuilder.toString(config));
+        
+        String version = JENKINS_INSTANCE.getPluginManager().getPlugin("openshift-sync").getVersion();
+        config.setUserAgent("openshift-sync-plugin-" + version + "/fabric8-" + Version.clientVersion());
         openShiftClient = new DefaultOpenShiftClient(config);
-        DefaultOpenShiftClient defClient = (DefaultOpenShiftClient)openShiftClient;
-        defClient.getHttpClient().dispatcher().setMaxRequestsPerHost(100);
-        defClient.getHttpClient().dispatcher().setMaxRequests(100);
+        logger.log(INFO, "New OpenShift client initialized: " + openShiftClient);
+
+        DefaultOpenShiftClient defClient = (DefaultOpenShiftClient) openShiftClient;
+        Dispatcher dispatcher = defClient.getHttpClient().dispatcher();
+//        int maxConnections = 100;//GlobalPluginConfiguration.get().getMaxConnections();
+        dispatcher.setMaxRequestsPerHost(maxConnections);
+        dispatcher.setMaxRequests(maxConnections);
     }
 
     public synchronized static OpenShiftClient getOpenShiftClient() {
@@ -152,30 +163,60 @@ public class OpenShiftUtils {
     // Get the current OpenShiftClient and configure to use the current Oauth
     // token.
     public synchronized static OpenShiftClient getAuthenticatedOpenShiftClient() {
+        if (openShiftClient == null) {
+            GlobalPluginConfiguration config = GlobalPluginConfiguration.get();
+            initializeOpenShiftClient(config.getServer(), config.getMaxConnections());
+        }
         if (openShiftClient != null) {
             String token = CredentialsUtils.getCurrentToken();
             if (token.length() > 0) {
                 openShiftClient.getConfiguration().setOauthToken(token);
             }
         }
-
         return openShiftClient;
     }
 
+    public static SharedInformerFactory getInformerFactory() {
+        return getAuthenticatedOpenShiftClient().informers();
+/*        if (factory == null) {
+            synchronized (lock) {
+                factory = getAuthenticatedOpenShiftClient().informers();
+            }
+        }
+        return factory;*/
+    }
+
     public synchronized static void shutdownOpenShiftClient() {
+        logger.info("Stopping openshift client: " + openShiftClient);
         if (openShiftClient != null) {
+            
+            // All this stuff is done by  openShiftClient.close();
+            
+//            DefaultOpenShiftClient client = (DefaultOpenShiftClient) openShiftClient;
+//            Dispatcher dispatcher = client.getHttpClient().dispatcher();
+//            ExecutorService executorService = dispatcher.executorService();
+//            try {
+//                dispatcher.cancelAll();
+//                client.getHttpClient().connectionPool().evictAll();
+//                //TODO Akram: shutting donw the executorService prevents other informers to re-attach to it.
+//                executorService.shutdown();
+//                TimeUnit.SECONDS.sleep(1);
+//            } catch (Exception e) {
+//                logger.warning("Error while stopping executor thread");
+//                executorService.shutdownNow();
+//            }
             openShiftClient.close();
             openShiftClient = null;
+//            factory = null;
         }
     }
 
     /**
      * Checks if a {@link BuildConfig} relates to a Jenkins build
      *
-     * @param bc
-     *            the BuildConfig
-     * @return true if this is an OpenShift BuildConfig which should be mirrored
-     *         to a Jenkins Job
+     * @param bc the BuildConfig
+     * @return true if this is an OpenShift BuildConfig which should be mirrored to
+     *         a Jenkins Job
      */
     public static boolean isPipelineStrategyBuildConfig(BuildConfig bc) {
         if (BuildConfigToJobMapper.JENKINS_PIPELINE_BUILD_STRATEGY
@@ -206,8 +247,7 @@ public class OpenShiftUtils {
             logger.warning("bad input, null strategy: " + b);
             return false;
         }
-        if (BuildConfigToJobMapper.JENKINS_PIPELINE_BUILD_STRATEGY
-                .equalsIgnoreCase(b.getSpec().getStrategy().getType())
+        if (BuildConfigToJobMapper.JENKINS_PIPELINE_BUILD_STRATEGY.equalsIgnoreCase(b.getSpec().getStrategy().getType())
                 && b.getSpec().getStrategy().getJenkinsPipelineStrategy() != null) {
             return true;
         }
@@ -217,8 +257,7 @@ public class OpenShiftUtils {
     /**
      * Finds the Jenkins job name for the given {@link BuildConfig}.
      *
-     * @param bc
-     *            the BuildConfig
+     * @param bc the BuildConfig
      * @return the jenkins job name for the given BuildConfig
      */
     public static String jenkinsJobName(BuildConfig bc) {
@@ -231,10 +270,9 @@ public class OpenShiftUtils {
     /**
      * Creates the Jenkins Job name for the given buildConfigName
      *
-     * @param namespace
-     *            the namespace of the build
-     * @param buildConfigName
-     *            the name of the {@link BuildConfig} in in the namespace
+     * @param namespace       the namespace of the build
+     * @param buildConfigName the name of the {@link BuildConfig} in in the
+     *                        namespace
      * @return the jenkins job name for the given namespace and name
      */
     public static String jenkinsJobName(String namespace, String buildConfigName) {
@@ -245,8 +283,7 @@ public class OpenShiftUtils {
      * Finds the full jenkins job path including folders for the given
      * {@link BuildConfig}.
      *
-     * @param bc
-     *            the BuildConfig
+     * @param bc the BuildConfig
      * @return the jenkins job name for the given BuildConfig
      */
     public static String jenkinsJobFullName(BuildConfig bc) {
@@ -255,22 +292,22 @@ public class OpenShiftUtils {
             return jobName;
         }
         if (GlobalPluginConfiguration.get().getFoldersEnabled()) {
-          return getNamespace(bc) + "/" + jenkinsJobName(getNamespace(bc), getName(bc));
+            return getNamespace(bc) + "/" + jenkinsJobName(getNamespace(bc), getName(bc));
         } else {
-          return getName(bc);
+            return getName(bc);
         }
     }
 
     /**
      * Returns the parent for the given item full name or default to the active
      * jenkins if it does not exist
+     * 
      * @param activeJenkins the active Jenkins instance
-     * @param fullName the full name of the instance
-     * @param namespace the namespace where the instance runs
+     * @param fullName      the full name of the instance
+     * @param namespace     the namespace where the instance runs
      * @return and ItemGroup representing the full parent
      */
-    public static ItemGroup getFullNameParent(Jenkins activeJenkins,
-            String fullName, String namespace) {
+    public static ItemGroup getFullNameParent(Jenkins activeJenkins, String fullName, String namespace) {
         int idx = fullName.lastIndexOf('/');
         if (idx > 0) {
             String parentFullName = fullName.substring(0, idx);
@@ -282,25 +319,21 @@ public class OpenShiftUtils {
                 // lets lazily create a new folder for this namespace parent
                 Folder folder = new Folder(activeJenkins, namespace);
                 try {
-                    folder.setDescription("Folder for the OpenShift project: "
-                            + namespace);
+                    folder.setDescription("Folder for the OpenShift project: " + namespace);
                 } catch (IOException e) {
                     // ignore
                 }
                 BulkChange bk = new BulkChange(folder);
-                InputStream jobStream = new StringInputStream(
-                        new XStream2().toXML(folder));
+                InputStream jobStream = new StringInputStream(new XStream2().toXML(folder));
                 try {
-                    activeJenkins.createProjectFromXML(namespace, jobStream)
-                            .save();
+                    activeJenkins.createProjectFromXML(namespace, jobStream).save();
                 } catch (IOException e) {
                     logger.warning("Failed to create the Folder: " + namespace);
                 }
                 try {
                     bk.commit();
                 } catch (IOException e) {
-                    logger.warning("Failed to commit toe BulkChange for the Folder: "
-                            + namespace);
+                    logger.warning("Failed to commit toe BulkChange for the Folder: " + namespace);
                 }
                 // lets look it up again to be sure
                 parent = activeJenkins.getItemByFullName(namespace);
@@ -315,8 +348,7 @@ public class OpenShiftUtils {
     /**
      * Finds the Jenkins job display name for the given {@link BuildConfig}.
      *
-     * @param bc
-     *            the BuildConfig
+     * @param bc the BuildConfig
      * @return the jenkins job display name for the given BuildConfig
      */
     public static String jenkinsJobDisplayName(BuildConfig bc) {
@@ -328,14 +360,12 @@ public class OpenShiftUtils {
     /**
      * Creates the Jenkins Job display name for the given buildConfigName
      *
-     * @param namespace
-     *            the namespace of the build
-     * @param buildConfigName
-     *            the name of the {@link BuildConfig} in in the namespace
+     * @param namespace       the namespace of the build
+     * @param buildConfigName the name of the {@link BuildConfig} in in the
+     *                        namespace
      * @return the jenkins job display name for the given namespace and name
      */
-    public static String jenkinsJobDisplayName(String namespace,
-            String buildConfigName) {
+    public static String jenkinsJobDisplayName(String namespace, String buildConfigName) {
         return namespace + "/" + buildConfigName;
     }
 
@@ -343,27 +373,21 @@ public class OpenShiftUtils {
      * Gets the current namespace running Jenkins inside or returns a reasonable
      * default
      *
-     * @param configuredNamespaces
-     *            the optional configured namespace(s)
-     * @param client
-     *            the OpenShift client
+     * @param configuredNamespaces the optional configured namespace(s)
+     * @param client               the OpenShift client
      * @return the default namespace using either the configuration value, the
      *         default namespace on the client or "default"
      */
-    public static String[] getNamespaceOrUseDefault(
-            String[] configuredNamespaces, OpenShiftClient client) {
+    public static String[] getNamespaceOrUseDefault(String[] configuredNamespaces, OpenShiftClient client) {
         String[] namespaces = configuredNamespaces;
 
         if (namespaces != null) {
             for (int i = 0; i < namespaces.length; i++) {
-                if (namespaces[i].startsWith("${")
-                        && namespaces[i].endsWith("}")) {
-                    String envVar = namespaces[i].substring(2,
-                            namespaces[i].length() - 1);
+                if (namespaces[i].startsWith("${") && namespaces[i].endsWith("}")) {
+                    String envVar = namespaces[i].substring(2, namespaces[i].length() - 1);
                     namespaces[i] = System.getenv(envVar);
                     if (StringUtils.isBlank(namespaces[i])) {
-                        logger.warning("No value defined for namespace environment variable `"
-                                + envVar + "`");
+                        logger.warning("No value defined for namespace environment variable `" + envVar + "`");
                     }
                 }
             }
@@ -380,30 +404,22 @@ public class OpenShiftUtils {
     /**
      * Returns the public URL of the given service
      *
-     * @param openShiftClient
-     *            the OpenShiftClient to use
-     * @param defaultProtocolText
-     *            the protocol text part of a URL such as <code>http://</code>
-     * @param namespace
-     *            the Kubernetes namespace
-     * @param serviceName
-     *            the service name
+     * @param openShiftClient     the OpenShiftClient to use
+     * @param defaultProtocolText the protocol text part of a URL such as
+     *                            <code>http://</code>
+     * @param namespace           the Kubernetes namespace
+     * @param serviceName         the service name
      * @return the external URL of the service
      */
-    public static String getExternalServiceUrl(OpenShiftClient openShiftClient,
-            String defaultProtocolText, String namespace, String serviceName) {
+    public static String getExternalServiceUrl(OpenShiftClient openShiftClient, String defaultProtocolText,
+            String namespace, String serviceName) {
         if (namespace != null && serviceName != null) {
             try {
-                RouteList routes = openShiftClient.routes()
-                        .inNamespace(namespace).list();
+                RouteList routes = openShiftClient.routes().inNamespace(namespace).list();
                 for (Route route : routes.getItems()) {
                     RouteSpec spec = route.getSpec();
-                    if (spec != null
-                            && spec.getTo() != null
-                            && "Service".equalsIgnoreCase(spec.getTo()
-                                    .getKind())
-                            && serviceName.equalsIgnoreCase(spec.getTo()
-                                    .getName())) {
+                    if (spec != null && spec.getTo() != null && "Service".equalsIgnoreCase(spec.getTo().getKind())
+                            && serviceName.equalsIgnoreCase(spec.getTo().getName())) {
                         String host = spec.getHost();
                         if (host != null && host.length() > 0) {
                             if (spec.getTls() != null) {
@@ -414,13 +430,12 @@ public class OpenShiftUtils {
                     }
                 }
             } catch (Exception e) {
-                logger.log(Level.WARNING, "Could not find Route for service "
-                        + namespace + "/" + serviceName + ". " + e, e);
+                logger.log(Level.WARNING,
+                        "Could not find Route for service " + namespace + "/" + serviceName + ". " + e, e);
             }
             // lets try the portalIP instead
             try {
-                Service service = openShiftClient.services()
-                        .inNamespace(namespace).withName(serviceName).get();
+                Service service = openShiftClient.services().inNamespace(namespace).withName(serviceName).get();
                 if (service != null) {
                     ServiceSpec spec = service.getSpec();
                     if (spec != null) {
@@ -431,8 +446,8 @@ public class OpenShiftUtils {
                     }
                 }
             } catch (Exception e) {
-                logger.log(Level.WARNING, "Could not find Route for service "
-                        + namespace + "/" + serviceName + ". " + e, e);
+                logger.log(Level.WARNING,
+                        "Could not find Route for service " + namespace + "/" + serviceName + ". " + e, e);
             }
         }
 
@@ -443,14 +458,11 @@ public class OpenShiftUtils {
     /**
      * Calculates the external URL to access Jenkins
      *
-     * @param namespace
-     *            the namespace Jenkins is runing inside
-     * @param openShiftClient
-     *            the OpenShift client
+     * @param namespace       the namespace Jenkins is runing inside
+     * @param openShiftClient the OpenShift client
      * @return the external URL to access Jenkins
      */
-    public static String getJenkinsURL(OpenShiftClient openShiftClient,
-            String namespace) {
+    public static String getJenkinsURL(OpenShiftClient openShiftClient, String namespace) {
         // if the user has explicitly configured the jenkins root URL, use it
         String rootUrl = Jenkins.getInstance().getRootUrl();
         if (StringUtils.isNotEmpty(rootUrl)) {
@@ -461,8 +473,7 @@ public class OpenShiftUtils {
         // the service/route
         // TODO we will eventually make the service name configurable, with the
         // default of "jenkins"
-        return getExternalServiceUrl(openShiftClient, "http://", namespace,
-                "jenkins");
+        return getExternalServiceUrl(openShiftClient, "http://", namespace, "jenkins");
     }
 
     public static String getNamespacefromPodInputs() {
@@ -472,15 +483,11 @@ public class OpenShiftUtils {
     /**
      * Lazily creates the GitSource if need be then updates the git URL
      * 
-     * @param buildConfig
-     *            the BuildConfig to update
-     * @param gitUrl
-     *            the URL to the git repo
-     * @param ref
-     *            the git ref (commit/branch/etc) for the build
+     * @param buildConfig the BuildConfig to update
+     * @param gitUrl      the URL to the git repo
+     * @param ref         the git ref (commit/branch/etc) for the build
      */
-    public static void updateGitSourceUrl(BuildConfig buildConfig,
-            String gitUrl, String ref) {
+    public static void updateGitSourceUrl(BuildConfig buildConfig, String gitUrl, String ref) {
         BuildConfigSpec spec = buildConfig.getSpec();
         if (spec == null) {
             spec = new BuildConfigSpec();
@@ -502,26 +509,22 @@ public class OpenShiftUtils {
     }
 
     public static void updateOpenShiftBuildPhase(Build build, String phase) {
-        logger.log(FINE, "setting build to {0} in namespace {1}/{2}",
-                new Object[] { phase, build.getMetadata().getNamespace(),
-                        build.getMetadata().getName() });
-        getAuthenticatedOpenShiftClient().builds()
-                .inNamespace(build.getMetadata().getNamespace())
-                .withName(build.getMetadata().getName()).edit().editStatus()
-                .withPhase(phase).endStatus().done();
+        String ns = build.getMetadata().getNamespace();
+        String name = build.getMetadata().getName();
+        logger.log(FINE, "setting build to {0} in namespace {1}/{2}", new Object[] { phase, ns, name });
+
+        BuildBuilder builder = new BuildBuilder(build).editStatus().withPhase(phase).endStatus();
+        getAuthenticatedOpenShiftClient().builds().inNamespace(ns).withName(name).edit(b -> builder.build());
     }
 
     /**
      * Maps a Jenkins Job name to an ObjectShift BuildConfig name
      *
      * @return the namespaced name for the BuildConfig
-     * @param jobName
-     *            the job to associate to a BuildConfig name
-     * @param namespace
-     *            the default namespace that Jenkins is running inside
+     * @param jobName   the job to associate to a BuildConfig name
+     * @param namespace the default namespace that Jenkins is running inside
      */
-    public static NamespaceName buildConfigNameFromJenkinsJobName(
-            String jobName, String namespace) {
+    public static NamespaceName buildConfigNameFromJenkinsJobName(String jobName, String namespace) {
         // TODO lets detect the namespace separator in the jobName for cases
         // where a jenkins is used for
         // BuildConfigs in multiple namespaces?
@@ -548,35 +551,28 @@ public class OpenShiftUtils {
         return dateFormatter.parseMillis(timestamp);
     }
 
-    public static boolean isResourceWithoutStateEqual(HasMetadata oldObj,
-            HasMetadata newObj) {
+    public static boolean isResourceWithoutStateEqual(HasMetadata oldObj, HasMetadata newObj) {
         try {
-            byte[] oldDigest = MessageDigest.getInstance("MD5").digest(
-                    dumpWithoutRuntimeStateAsYaml(oldObj).getBytes(
-                            StandardCharsets.UTF_8));
-            byte[] newDigest = MessageDigest.getInstance("MD5").digest(
-                    dumpWithoutRuntimeStateAsYaml(newObj).getBytes(
-                            StandardCharsets.UTF_8));
+            byte[] oldDigest = MessageDigest.getInstance("MD5")
+                    .digest(dumpWithoutRuntimeStateAsYaml(oldObj).getBytes(StandardCharsets.UTF_8));
+            byte[] newDigest = MessageDigest.getInstance("MD5")
+                    .digest(dumpWithoutRuntimeStateAsYaml(newObj).getBytes(StandardCharsets.UTF_8));
             return Arrays.equals(oldDigest, newDigest);
         } catch (NoSuchAlgorithmException | JsonProcessingException e) {
             throw new RuntimeException(e);
         }
     }
 
-    public static String dumpWithoutRuntimeStateAsYaml(HasMetadata obj)
-            throws JsonProcessingException {
+    public static String dumpWithoutRuntimeStateAsYaml(HasMetadata obj) throws JsonProcessingException {
         ObjectMapper statelessMapper = new ObjectMapper(new YAMLFactory());
-        statelessMapper.addMixInAnnotations(ObjectMeta.class,
-                ObjectMetaMixIn.class);
-        statelessMapper.addMixInAnnotations(ReplicationController.class,
-                StatelessReplicationControllerMixIn.class);
+        statelessMapper.addMixInAnnotations(ObjectMeta.class, ObjectMetaMixIn.class);
+        statelessMapper.addMixInAnnotations(ReplicationController.class, StatelessReplicationControllerMixIn.class);
         return statelessMapper.writeValueAsString(obj);
     }
 
     public static boolean isCancellable(BuildStatus buildStatus) {
         String phase = buildStatus.getPhase();
-        return phase.equals(NEW) || phase.equals(PENDING)
-                || phase.equals(RUNNING);
+        return phase.equals(NEW) || phase.equals(PENDING) || phase.equals(RUNNING);
     }
 
     public static boolean isNew(BuildStatus buildStatus) {
@@ -584,8 +580,7 @@ public class OpenShiftUtils {
     }
 
     public static boolean isCancelled(BuildStatus status) {
-        return status != null && status.getCancelled() != null
-                && Boolean.TRUE.equals(status.getCancelled());
+        return status != null && status.getCancelled() != null && Boolean.TRUE.equals(status.getCancelled());
     }
 
     /**
@@ -626,8 +621,7 @@ public class OpenShiftUtils {
         return null;
     }
 
-    public static void addAnnotation(HasMetadata resource, String name,
-            String value) {
+    public static void addAnnotation(HasMetadata resource, String name, String value) {
         ObjectMeta metadata = resource.getMetadata();
         if (metadata == null) {
             metadata = new ObjectMeta();
@@ -657,12 +651,11 @@ public class OpenShiftUtils {
         return null;
     }
 
-  protected static OpenShiftClient getOpenshiftClient() {
-       return getAuthenticatedOpenShiftClient();
-   }
+    protected static OpenShiftClient getOpenshiftClient() {
+        return getAuthenticatedOpenShiftClient();
+    }
 
-  abstract class StatelessReplicationControllerMixIn extends
-            ReplicationController {
+    abstract class StatelessReplicationControllerMixIn extends ReplicationController {
         @JsonIgnore
         private ReplicationControllerStatus status;
 

@@ -15,152 +15,106 @@
  */
 package io.fabric8.jenkins.openshiftsync;
 
-import static java.net.HttpURLConnection.HTTP_GONE;
+import static org.apache.commons.lang.builder.ToStringStyle.DEFAULT_STYLE;
 
-import io.fabric8.kubernetes.client.KubernetesClientException;
-import io.fabric8.kubernetes.client.Watch;
-
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 
-import org.csanchez.jenkins.plugins.kubernetes.PodTemplate;
+import org.apache.commons.lang.builder.ReflectionToStringBuilder;
 
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
-import jenkins.util.Timer;
+import hudson.triggers.SafeTimerTask;
+import io.fabric8.kubernetes.client.KubernetesClientException;
+import io.fabric8.kubernetes.client.Watch;
+import io.fabric8.kubernetes.client.Watcher;
+import io.fabric8.kubernetes.client.WatcherException;
 
-public abstract class BaseWatcher {
+public abstract class BaseWatcher<T> implements Watcher<T> {
     private final Logger LOGGER = Logger.getLogger(BaseWatcher.class.getName());
 
-    protected ScheduledFuture relister;
-    protected final String[] namespaces;
-    protected ConcurrentHashMap<String, Watch> watches;
-    private final String PT_NAME_CLAIMED = "The event for %s | %s | %s that attempts to add the pod template %s was ignored because a %s previously created a pod template with the same name";
-    private final String PT_NOT_OWNED = "The event for %s | %s | %s that no longer includes the pod template %s was ignored because the type %s was associated with that pod template";
+    // protected ScheduledFuture relister;
+    protected final transient Object lock = new Object();
+    // protected ConcurrentHashMap<String, Watch> watches;
+    protected final String namespace;
+    protected Watch watch;
 
     @SuppressFBWarnings("EI_EXPOSE_REP2")
-    public BaseWatcher(String[] namespaces) {
-        this.namespaces = namespaces;
-        watches = new ConcurrentHashMap<>();
+    public BaseWatcher(String namespace) {
+        this.namespace = namespace;
     }
 
-    public abstract Runnable getStartTimerTask();
+    public abstract int getResyncPeriodMilliseconds();
 
-    public abstract int getListIntervalInSeconds();
+    protected abstract void start();
 
-    public abstract <T> void eventReceived(io.fabric8.kubernetes.client.Watcher.Action action, T resource);
+    @Override
+    public void onClose(WatcherException cause) {
+        Watcher<T> watcher = this;
+        LOGGER.info("Closing watcher: cause: " + cause + ", watcher: " + watcher);
+        if (cause != null) {
+            synchronized (this.lock) {
+                LOGGER.info("Watcher stopped unexpectedly for : " + this.namespace + ", will restart:" + cause);
+                this.watch.close();
+                this.watch = null;
+                this.start();
+            }
+        }
+    }
 
-    public synchronized void start() {
-        // lets do this in a background thread to avoid errors like:
-        // Tried proxying
-        // io.fabric8.jenkins.openshiftsync.GlobalPluginConfiguration to support
-        // a circular dependency, but it is not an interface.
-        Runnable task = getStartTimerTask();
-        relister = Timer.get().scheduleAtFixedRate(task, 100, // still do the
-                                                              // first run 100
-                                                              // milliseconds in
-                getListIntervalInSeconds() * 1000,
-                TimeUnit.MILLISECONDS);
+    public void onClose(KubernetesClientException cause) {
+        this.onClose(new WatcherException(cause.getMessage(), cause));
+    }
 
+    public final Runnable getStartTimerTask() {
+        return new SafeTimerTask() {
+            @Override
+            public void doRun() {
+                if (!CredentialsUtils.hasCredentials()) {
+                    LOGGER.fine("No Openshift Token credential defined.");
+                    return;
+                }
+                start();
+            }
+        };
+    }
+
+    public void startAfterOnClose(String namespace) {
+        synchronized (this.lock) {
+            start();
+        }
+    }
+
+    @Override
+    public void onClose() {
+        Watcher<T> watcher = this;
+        String namespace = getNamespace();
+        LOGGER.info("Closing watcher without cause: " + watcher);
+        WatcherException cause = new WatcherException("Received closed event without exception");
+        // TODO implement here what should be done when closing this watcher
+        // TODO Let's reimplement it, using Observer pattern and notifying the
+        // GlobalPluginConfiguration listener
+        // super.onClose(cause);
+        // watcher.onClose(cause);
     }
 
     public void stop() {
-        if (relister != null && !relister.isDone()) {
-            relister.cancel(true);
-            relister = null;
-        }
-
-        for (Map.Entry<String, Watch> entry : watches.entrySet()) {
-            entry.getValue().close();
-            watches.remove(entry.getKey());
-        }
-    }
-
-    public void onClose(KubernetesClientException e, String namespace) {
-        //scans of fabric client confirm this call be called with null
-        //we do not want to totally ignore this, as the closing of the
-        //watch can effect responsiveness
-        LOGGER.info("Watch for type " + this.getClass().getName() + " closed for one of the following namespaces: " + watches.keySet().toString());
-        if (e != null) {
-            LOGGER.warning(e.toString());
-
-            if (e.getStatus() != null && e.getStatus().getCode() == HTTP_GONE) {
-                stop();
-                start();
-            }
-        }
-        // clearing the watches here will signal the extending classes
-        // to attempt to re-establish the watch the next time they attempt
-        // to list; should shield from rapid/repeated close/reopen cycles
-        // doing it in this fashion
-        watches.remove(namespace);
-    }
-
-    public void addWatch(String key, Watch desiredWatch) {
-        Watch watch = watches.putIfAbsent(key, desiredWatch);
-        if (watch != null) {
-          watch.close();
-        }
-    }
-
-    protected void processSlavesForAddEvent(List<PodTemplate> slaves, String type, String uid, String apiObjName, String namespace) {
-      LOGGER.info("Adding PodTemplate(s) for ");
-      List<PodTemplate> finalSlaveList = new ArrayList<PodTemplate>();
-        for (PodTemplate podTemplate : slaves) {
-          PodTemplateUtils.addPodTemplate(this, type, apiObjName, namespace, finalSlaveList, podTemplate);
-        }
-        PodTemplateUtils.updateTrackedPodTemplatesMap(uid, finalSlaveList);
-    }
-
-    protected void processSlavesForModifyEvent(List<PodTemplate> slaves, String type, String uid, String apiObjName, String namespace) {
-        LOGGER.info("Modifying PodTemplates");
-        boolean alreadyTracked = PodTemplateUtils.trackedPodTemplates.containsKey(uid);
-        boolean hasSlaves = slaves.size() > 0; // Configmap has podTemplates
-        if (alreadyTracked) {
-            if (hasSlaves) {
-                // Since the user could have change the immutable image
-                // that a PodTemplate uses, we just
-                // recreate the PodTemplate altogether. This makes it so
-                // that any changes from within
-                // Jenkins is undone.
-
-                // Check if there are new PodTemplates added or removed to the configmap,
-                // if they are, add them to or remove them from trackedPodTemplates
-                List<PodTemplate> podTemplatesToTrack = new ArrayList<PodTemplate>();
-                PodTemplateUtils.purgeTemplates(this, type, uid, apiObjName, namespace);
-                for(PodTemplate pt: slaves){
-                    podTemplatesToTrack = PodTemplateUtils.onlyTrackPodTemplate(this, type,apiObjName,namespace,podTemplatesToTrack, pt);
+        if (this.watch != null) {
+            synchronized (this.lock) {
+                if (this.watch != null) {
+                    LOGGER.info("Stopping watcher: " + this + " by closing its watch: " + this.watch);
+                    this.watch.close();
+                    this.watch = null;
                 }
-                PodTemplateUtils.updateTrackedPodTemplatesMap(uid, podTemplatesToTrack);
-                for (PodTemplate podTemplate : podTemplatesToTrack) {
-                      // still do put here in case this is a new item from the last
-                      // update on this ConfigMap/ImageStream
-                      PodTemplateUtils.addPodTemplate(this, type,null,null,null, podTemplate);
-                }
-            } else {
-                // The user modified the configMap to no longer be a
-                // jenkins-slave.
-                PodTemplateUtils.purgeTemplates(this, type, uid, apiObjName, namespace);
-            }
-        } else {
-            if (hasSlaves) {
-                List<PodTemplate> finalSlaveList = new ArrayList<PodTemplate>();
-                for (PodTemplate podTemplate : slaves) {
-                  // The user modified the api obj to be a jenkins-slave
-                  PodTemplateUtils.addPodTemplate(this, type, apiObjName, namespace, finalSlaveList, podTemplate);
-                }
-                PodTemplateUtils.updateTrackedPodTemplatesMap(uid, finalSlaveList);
             }
         }
     }
 
-    protected void processSlavesForDeleteEvent(List<PodTemplate> slaves, String type, String uid, String apiObjName, String namespace) {
-        if (PodTemplateUtils.trackedPodTemplates.containsKey(uid)) {
-            PodTemplateUtils.purgeTemplates(this, type, uid, apiObjName, namespace);
-        }
+    public String toString() {
+        return ReflectionToStringBuilder.toString(this, DEFAULT_STYLE, false, false)
+                + ReflectionToStringBuilder.toString(this.watch);
     }
+
+    public String getNamespace() {
+        return namespace;
+    }
+
 }

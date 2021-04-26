@@ -25,7 +25,7 @@
     <jenkins.version>2.263</jenkins.version>
     <java.level>8</java.level>
     <jenkins-test-harness.version>2.71</jenkins-test-harness.version>
-    <openshift-client.version>4.13.2</openshift-client.version>
+    <openshift-client.version>5.3.0</openshift-client.version>
     <log.level>DEBUG</log.level>
     <findbugs-maven-plugin.version>3.0.4</findbugs-maven-plugin.version>
     <findbugs.failOnError>false</findbugs.failOnError>
@@ -141,11 +141,7 @@
     <dependency>
       <groupId>org.slf4j</groupId>
       <artifactId>slf4j-api</artifactId>
-    </dependency>
-    <dependency>
-      <groupId>org.slf4j</groupId>
-      <artifactId>slf4j-simple</artifactId>
-      <version>${slf4j.version}</version>
+      <scope>provided</scope>
     </dependency>
 
     <dependency>
@@ -157,14 +153,13 @@
     <dependency>
       <groupId>org.csanchez.jenkins.plugins</groupId>
       <artifactId>kubernetes</artifactId>
-      <version>1.29.0</version>
+      <version>1.28.3</version>
     </dependency>
-    <dependency>
-      <groupId>io.fabric8</groupId>
-      <artifactId>kubernetes-client</artifactId>
-      <version>4.13.2</version>
-      <scope>provided</scope>
-    </dependency>
+     <dependency>
+       <groupId>org.jenkins-ci.plugins</groupId>
+       <artifactId>kubernetes-client-api</artifactId>
+       <version>5.3.0-beta-1-SNAPSHOT</version>
+     </dependency>
 
     <dependency>
       <groupId>org.eclipse.jetty</groupId>

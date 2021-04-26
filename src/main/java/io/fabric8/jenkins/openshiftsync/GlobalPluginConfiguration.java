@@ -16,24 +16,33 @@
 package io.fabric8.jenkins.openshiftsync;
 
 import static hudson.security.ACL.SYSTEM;
+import static io.fabric8.jenkins.openshiftsync.OpenShiftUtils.getAuthenticatedOpenShiftClient;
 import static io.fabric8.jenkins.openshiftsync.OpenShiftUtils.getNamespaceOrUseDefault;
 import static io.fabric8.jenkins.openshiftsync.OpenShiftUtils.getOpenShiftClient;
+import static io.fabric8.jenkins.openshiftsync.OpenShiftUtils.shutdownOpenShiftClient;
 import static java.util.concurrent.TimeUnit.SECONDS;
-import static java.util.logging.Level.SEVERE;
 import static jenkins.model.Jenkins.ADMINISTER;
 
+import java.io.IOException;
+import java.util.concurrent.ScheduledFuture;
 import java.util.logging.Logger;
 
+import javax.servlet.ServletException;
+
 import org.apache.commons.lang.StringUtils;
+import org.kohsuke.stapler.AncestorInPath;
 import org.kohsuke.stapler.DataBoundConstructor;
+import org.kohsuke.stapler.QueryParameter;
 import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.verb.POST;
 
 import com.cloudbees.plugins.credentials.common.StandardListBoxModel;
 
 import hudson.Extension;
 import hudson.Util;
+import hudson.model.Job;
+import hudson.util.FormValidation;
 import hudson.util.ListBoxModel;
-import io.fabric8.kubernetes.client.KubernetesClientException;
 import jenkins.model.GlobalConfiguration;
 import jenkins.model.Jenkins;
 import jenkins.util.Timer;
@@ -46,8 +55,16 @@ public class GlobalPluginConfiguration extends GlobalConfiguration {
 
     private boolean enabled = true;
     private boolean foldersEnabled = true;
+    private boolean useClusterMode = false;
+    private boolean syncConfigMaps = true;
+    private boolean syncSecrets = true;
+    private boolean syncImageStreams = true;
+    private boolean syncBuildConfigsAndBuilds = true;
+
     private String server;
     private String credentialsId = "";
+    private int maxConnections = 100;
+
     private String[] namespaces;
     private String jobNamePattern;
     private String skipOrganizationPrefix;
@@ -58,17 +75,15 @@ public class GlobalPluginConfiguration extends GlobalConfiguration {
     private int configMapListInterval = 300;
     private int imageStreamListInterval = 300;
 
-    private transient BuildWatcher buildWatcher;
-    private transient BuildConfigWatcher buildConfigWatcher;
-    private transient SecretWatcher secretWatcher;
-    private transient ConfigMapWatcher configMapWatcher;
-    private transient ImageStreamWatcher imageStreamWatcher;
+    private static GlobalPluginConfigurationTimerTask TASK;
+    private static ScheduledFuture<?> FUTURE;
 
     @DataBoundConstructor
     public GlobalPluginConfiguration(boolean enable, String server, String namespace, boolean foldersEnabled,
             String credentialsId, String jobNamePattern, String skipOrganizationPrefix, String skipBranchSuffix,
             int buildListInterval, int buildConfigListInterval, int configMapListInterval, int secretListInterval,
-            int imageStreamListInterval) {
+            int imageStreamListInterval, boolean useClusterMode, boolean syncConfigMaps, boolean syncSecrets,
+            boolean syncImageStreams, boolean syncBuildsConfigAndBuilds, int maxConnections) {
         this.enabled = enable;
         this.server = server;
         this.namespaces = StringUtils.isBlank(namespace) ? null : namespace.split(" ");
@@ -82,6 +97,12 @@ public class GlobalPluginConfiguration extends GlobalConfiguration {
         this.configMapListInterval = configMapListInterval;
         this.secretListInterval = secretListInterval;
         this.imageStreamListInterval = imageStreamListInterval;
+        this.useClusterMode = useClusterMode;
+        this.syncConfigMaps = syncConfigMaps;
+        this.syncSecrets = syncSecrets;
+        this.syncImageStreams = syncImageStreams;
+        this.syncBuildConfigsAndBuilds = syncBuildsConfigAndBuilds;
+        this.maxConnections = maxConnections;
         configChange();
     }
 
@@ -93,6 +114,100 @@ public class GlobalPluginConfiguration extends GlobalConfiguration {
 
     public static GlobalPluginConfiguration get() {
         return GlobalConfiguration.all().get(GlobalPluginConfiguration.class);
+    }
+
+    private synchronized void configChange() {
+        logger.info("OpenShift Sync Plugin processing a newly supplied configuration");
+        stop();
+//        shutdownOpenShiftClient();
+        start();
+    }
+
+    private void start() {
+        if (this.enabled) {
+            OpenShiftUtils.initializeOpenShiftClient(this.server, this.maxConnections);
+            this.namespaces = getNamespaceOrUseDefault(this.namespaces, getOpenShiftClient());
+            if (TASK != null) {
+                logger.warning("Previously existing configuration task");
+            }
+            TASK = new GlobalPluginConfigurationTimerTask(this.namespaces);
+            FUTURE = Timer.get().schedule(TASK, 1, SECONDS); // lets give jenkins a while to get started ;)
+        } else {
+            logger.info("OpenShift Sync Plugin has been disabled");
+        }
+    }
+
+    private void stop() {
+        if (FUTURE != null) {
+            boolean interrupted = FUTURE.cancel(true);
+            if (interrupted) {
+                logger.info("OpenShift Sync Plugin task has been interrupted");
+            }
+        }
+        if (TASK != null) {
+            TASK.stop();
+            TASK.cancel();
+            TASK = null;
+        }
+        OpenShiftUtils.shutdownOpenShiftClient();
+    }
+
+    /**
+     * Validates OpenShift Sync Configuration form by chec
+     */
+    @POST
+    public FormValidation doValidate(@QueryParameter("useClusterMode") final boolean useClusterMode,
+            @QueryParameter("syncConfigMaps") final boolean syncConfigMaps,
+            @QueryParameter("syncSecrets") final boolean syncSecrets,
+            @QueryParameter("syncImageStreams") final boolean syncImageStreams,
+            @QueryParameter("syncBuildConfigsAndBuilds") final boolean syncBuildConfigsAndBuilds,
+            @QueryParameter("maxConnections") final int maxConnections,
+            @QueryParameter("namespace") final String namespace, @SuppressWarnings("rawtypes") @AncestorInPath Job job)
+            throws IOException, ServletException {
+        if (useClusterMode) {
+            try {
+                int secrets = getAuthenticatedOpenShiftClient().secrets().inAnyNamespace().list().getItems().size();
+                logger.info("Cluster secrets: " + secrets);
+            } catch (Exception e) {
+                StringBuilder message = new StringBuilder();
+                message.append("The ServiceAccount used by Jenkins does not have cluster wide watch permissions.\n");
+                message.append("To use cluster mode, you need to run the following commands an restart Jenkins: \n\n");
+                message.append("oc create clusterrole jenkins-watcher --verb=get,list,watch \\\n");
+                message.append("    --resource=configmaps,builds,buildconfigs,imagestreams,secrets\n\n");
+                message.append("oc adm policy add-cluster-role-to-user jenkins-watcher -z jenkins\n");
+                logger.severe("Error while trying to query secrets lists: " + e);
+                return FormValidation.error(message.toString());
+            }
+        } else {
+            StringBuilder message = new StringBuilder();
+            if (maxConnections > 200) {
+                message.append("Cluster mode is recommended if max connections is greater than 200.");
+            }
+            int requiredConnectionsCount = 0;
+            if (syncBuildConfigsAndBuilds) {
+                requiredConnectionsCount += 2;
+            }
+            if (syncImageStreams) {
+                requiredConnectionsCount++;
+            }
+            if (syncSecrets) {
+                requiredConnectionsCount++;
+            }
+            if (syncConfigMaps) {
+                requiredConnectionsCount++;
+            }
+            String[] namespaces = StringUtils.isBlank(namespace) ? new String[] {} : namespace.split(" ");
+            int namespacesCount = namespaces.length;
+            requiredConnectionsCount = namespacesCount * requiredConnectionsCount;
+            if (maxConnections < requiredConnectionsCount) {
+                message.append(String.format("Watching %s namespaces with your configuration requires %s connections.",
+                        namespacesCount, requiredConnectionsCount));
+            }
+            if (message.length() > 0) {
+                return FormValidation.warning(message.toString());
+            }
+        }
+        return FormValidation.ok("Success");
     }
 
     @Override
@@ -239,62 +354,52 @@ public class GlobalPluginConfiguration extends GlobalConfiguration {
         this.namespaces = namespaces;
     }
 
-    void setBuildWatcher(BuildWatcher buildWatcher) {
-        this.buildWatcher = buildWatcher;
+    public boolean isUseClusterMode() {
+        return useClusterMode;
     }
 
-    void setBuildConfigWatcher(BuildConfigWatcher buildConfigWatcher) {
-        this.buildConfigWatcher = buildConfigWatcher;
+    public void setUseClusterMode(boolean useClusterMode) {
+        this.useClusterMode = useClusterMode;
     }
 
-    void setSecretWatcher(SecretWatcher secretWatcher) {
-        this.secretWatcher = secretWatcher;
+    public boolean isSyncConfigMaps() {
+        return syncConfigMaps;
     }
 
-    void setConfigMapWatcher(ConfigMapWatcher configMapWatcher) {
-        this.configMapWatcher = configMapWatcher;
+    public void setSyncConfigMaps(boolean syncConfigMaps) {
+        this.syncConfigMaps = syncConfigMaps;
     }
 
-    void setImageStreamWatcher(ImageStreamWatcher imageStreamWatcher) {
-        this.imageStreamWatcher = imageStreamWatcher;
+    public boolean isSyncSecrets() {
+        return syncSecrets;
     }
 
-    private synchronized void configChange() {
-        logger.info("OpenShift Sync Plugin processing a newly supplied configuration");
-        if (this.buildConfigWatcher != null) {
-            this.buildConfigWatcher.stop();
-        }
-        if (this.buildWatcher != null) {
-            this.buildWatcher.stop();
-        }
-        if (this.configMapWatcher != null) {
-            this.configMapWatcher.stop();
-        }
-        if (this.imageStreamWatcher != null) {
-            this.imageStreamWatcher.stop();
-        }
-        if (this.secretWatcher != null) {
-            this.secretWatcher.stop();
-        }
-        this.buildWatcher = null;
-        this.buildConfigWatcher = null;
-        this.configMapWatcher = null;
-        this.imageStreamWatcher = null;
-        this.secretWatcher = null;
-        OpenShiftUtils.shutdownOpenShiftClient();
-
-        if (!this.enabled) {
-            logger.info("OpenShift Sync Plugin has been disabled");
-            return;
-        }
-        try {
-            OpenShiftUtils.initializeOpenShiftClient(this.server);
-            this.namespaces = getNamespaceOrUseDefault(this.namespaces, getOpenShiftClient());
-            Runnable task = new GlobalPluginConfigurationTimerTask(this);
-            Timer.get().schedule(task, 1, SECONDS); // lets give jenkins a while to get started ;)
-        } catch (KubernetesClientException e) {
-            Throwable exceptionOrCause = (e.getCause() != null) ? e.getCause() : e;
-            logger.log(SEVERE, "Failed to configure OpenShift Jenkins Sync Plugin: " + exceptionOrCause);
-        }
+    public void setSyncSecrets(boolean syncSecrets) {
+        this.syncSecrets = syncSecrets;
     }
+
+    public boolean isSyncImageStreams() {
+        return syncImageStreams;
+    }
+
+    public void setSyncImageStreams(boolean syncImageStreams) {
+        this.syncImageStreams = syncImageStreams;
+    }
+
+    public boolean isSyncBuildConfigsAndBuilds() {
+        return syncBuildConfigsAndBuilds;
+    }
+
+    public void setSyncBuildConfigsAndBuilds(boolean syncBuildConfigsAndBuilds) {
+        this.syncBuildConfigsAndBuilds = syncBuildConfigsAndBuilds;
+    }
+
+    public int getMaxConnections() {
+        return maxConnections;
+    }
+
+    public void setMaxConnections(int maxConnections) {
+        this.maxConnections = maxConnections;
+    }
+
 }

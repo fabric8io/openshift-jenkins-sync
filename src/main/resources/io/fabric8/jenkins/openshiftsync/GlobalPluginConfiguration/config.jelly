@@ -1,5 +1,4 @@
 <!--
-
     Copyright (C) 2016 Red Hat, Inc.
 
     Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,56 +17,82 @@
 <?jelly escape-by-default='true'?>
 <j:jelly xmlns:j="jelly:core" xmlns:f="/lib/form" xmlns:c="/lib/credentials">
   <f:section title="OpenShift Jenkins Sync">
-    <f:entry title="Enabled" field="enabled"
-             description="Check if we should sync OpenShift builds with Jenkins jobs">
-      <f:checkbox/>
+    <f:entry title="Enabled" field="enabled" description="Check to activate the sync plugin.">
+      <f:checkbox />
+    </f:entry>
+    <f:entry title="Cluster mode" field="useClusterMode"
+      description="Check to enable cluster mode. Cluster mode uses 1 connection per type to watch and requires the jenkins serviceaccount to have cluster-reader permission. If unchecked, 5 connections for every watched namespace will be used. We recommend to use cluster mode if you need more than 200 connections.">
+      <f:checkbox />
+    </f:entry>
+
+    <f:entry title="BuildConfigs and Build sync" field="syncBuildConfigsAndBuilds"
+      description="Check to sync OpenShift builds and buildConfigs with Jenkins jobs">
+      <f:checkbox />
+    </f:entry>
+    <f:entry title="Secrets sync" field="syncSecrets"
+      description="Check to sync OpenShift secrets with Jenkins credentials">
+      <f:checkbox />
+    </f:entry>
+    <f:entry title="ConfigMap sync" field="syncConfigMaps"
+      description="Check to sync OpenShift configMaps with Jenkins configurations">
+      <f:checkbox />
+    </f:entry>
+    <f:entry title="ImageStreams sync" field="syncImageStreams"
+      description="Check to sync OpenShift imageStreams with Jenkins PodTemplates">
+      <f:checkbox />
     </f:entry>
     <f:entry title="Server" field="server"
-             description="The API server to sync against - leave blank if running on an OpenShift cluster">
-      <f:textbox/>
+      description="The API server to sync against - leave blank if running on an OpenShift cluster">
+      <f:textbox />
     </f:entry>
     <f:entry title="${%Credentials}" field="credentialsId">
-      <c:select/>
+      <c:select />
     </f:entry>
     <f:entry title="Namespace" field="namespace"
-             description="The namespace to sync BuildConfigs with. Environment variables in the form ${name} will be expanded.  Multiple namespaces can be listed using a space separator.">
-      <f:textbox/>
+      description="The namespace to sync BuildConfigs with. Environment variables in the form ${name} will be expanded.  Multiple namespaces can be listed using a space separator.">
+      <f:textbox />
+    </f:entry>
+    <f:entry title="Maximum connections number" field="maxConnections"
+      description="The maximum number of connections to the API Server. If this value is greater that 200, it is recommended to use cluster mode.">
+      <f:textbox />
     </f:entry>
     <f:entry title="Folders" field="foldersEnabled"
-             description="Check if we should create folders for each OpenShift namespace">
-      <f:checkbox/>
+      description="Check to create folders for each OpenShift namespace">
+      <f:checkbox />
     </f:entry>
     <f:entry title="Sync Job Name Pattern " field="jobNamePattern"
-             description="The regular expression to match pipeline job names which should be sync'd to BuildConfigs in OpenShift - leave blank to not sync Jenkins Jobs to OpenShift BuildConfigs.">
-      <f:textbox/>
+      description="The regular expression to match pipeline job names which should be sync'd to BuildConfigs in OpenShift - leave blank to not sync Jenkins Jobs to OpenShift BuildConfigs.">
+      <f:textbox />
     </f:entry>
     <f:entry title="Skip organization prefix" field="skipOrganizationPrefix"
-             description="What organization name prefix should we omit from the generated OpenShift BuildConfig resources created by the sync plugin. Its common for one user/team to use the same git organization so prefixing all BuildConfig names with the organization name can be noisy.">
-      <f:textbox/>
+      description="What organization name prefix should we omit from the generated OpenShift BuildConfig resources created by the sync plugin. Its common for one user/team to use the same git organization so prefixing all BuildConfig names with the organization name can be noisy.">
+      <f:textbox />
     </f:entry>
     <f:entry title="Skip branch suffix" field="skipBranchSuffix"
-             description="What branch name suffix should we omit from the generated OpenShift BuildConfig resources created by the sync plugin.  Its common to use a common branch name like `master` which we can omit from names to avoid noise.">
-      <f:textbox/>
+      description="What branch name suffix should we omit from the generated OpenShift BuildConfig resources created by the sync plugin.  Its common to use a common branch name like `master` which we can omit from names to avoid noise.">
+      <f:textbox />
     </f:entry>
     <f:entry title="Build list interval" field="buildListInterval"
-             description="Time in seconds the sync plugin runs a list operation for builds">
-      <f:textbox/>
+      description="Time in seconds the sync plugin runs a list operation for builds">
+      <f:textbox />
     </f:entry>
     <f:entry title="Build config list interval" field="buildConfigListInterval"
-             description="Time in seconds the sync plugin runs a list operation for builds configs">
-      <f:textbox/>
+      description="Time in seconds the sync plugin runs a list operation for builds configs">
+      <f:textbox />
     </f:entry>
     <f:entry title="Config map list interval" field="configMapListInterval"
-             description="Time in seconds the sync plugin runs a list operation for config maps">
-      <f:textbox/>
+      description="Time in seconds the sync plugin runs a list operation for config maps">
+      <f:textbox />
     </f:entry>
     <f:entry title="Image stream list interval" field="imageStreamListInterval"
-             description="Time in seconds the sync plugin runs a list operation for image streams">
-      <f:textbox/>
+      description="Time in seconds the sync plugin runs a list operation for image streams">
+      <f:textbox />
     </f:entry>
     <f:entry title="Secret list interval" field="secretListInterval"
-             description="Time in seconds the sync plugin runs a list operation for secrets">
-      <f:textbox/>
+      description="Time in seconds the sync plugin runs a list operation for secrets">
+      <f:textbox />
     </f:entry>
+    <f:validateButton title="Validate configuration" progress="Validating..." method="validate"
+      with="useClusterMode,syncConfigMaps,syncSecrets,syncImageStreams,syncBuildConfigsAndBuilds,maxConnections,namespace" />
   </f:section>
 </j:jelly>
